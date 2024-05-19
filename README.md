@@ -1,2 +1,1 @@
-# aws-forecasting
-AWS forecasting
+# AWS Forecasting

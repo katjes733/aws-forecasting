@@ -2,6 +2,8 @@ import time
 import json
 import gzip
 import re
+import math
+from datetime import datetime
 
 import boto3
 import botocore.exceptions
@@ -9,7 +11,14 @@ import botocore.exceptions
 import pandas as pd
 import matplotlib.pyplot as plt
 
+from bokeh.plotting import figure
+from bokeh.models import ColumnDataSource, NumeralTickFormatter, DatetimeTickFormatter
+from bokeh.models.tools import HoverTool, CrosshairTool
+
 import util.notebook_utils
+
+default_df = '%Y%m%d_%H%M%S'
+default_ui_df = '%a, %d %b %Y %H:%M:%S %Z'
 
 
 def wait_till_delete(callback, check_time = 5, timeout = None):
@@ -44,6 +53,32 @@ def wait(callback, time_interval = 10):
     status_indicator.end()
 
     return (status == "ACTIVE")
+
+
+def create_forecast_name(prefix, algorithm, date_format=default_df):
+    forecast_name = f"{prefix}_{algorithm}"
+    forecast_name_unique = f"{forecast_name}_{datetime.now().strftime(date_format)}"
+    return forecast_name, forecast_name_unique
+
+
+def create_forecast(forecast_name, forecast_name_unique, predictor_arn, forecast_client, tags=[], ui_date_format=default_ui_df):
+    existing_forecasts = util.get_forecasts(forecast_name, forecast_client, False)
+    
+    if len(existing_forecasts) > 0:
+        print(f"Forecasts exist with the latest one from {existing_forecasts[0]['CreationTime'].strftime(ui_date_format)}.")
+        if not input("Create new forecast (y/N)? ").lower() == "y":
+            return existing_forecasts[0]["ForecastArn"]
+
+    create_forecast_response = forecast_client.create_forecast(ForecastName=forecast_name_unique,
+                                                               PredictorArn=predictor_arn,
+                                                               Tags=tags
+                                                              )
+    forecast_arn = create_forecast_response['ForecastArn']
+    print(f"Creating new forecast {forecast_arn} for predictor {predictor_arn}...")
+    status = util.wait(lambda: forecast.describe_forecast(ForecastArn=forecast_arn))
+    assert status
+    
+    return forecast_arn
 
 
 def get_forecasts(forecast_name, forecast, exact=True):
@@ -256,19 +291,65 @@ def plot_forecasts(fcsts, exact, freq = '1D', forecastHorizon=30, time_back = 30
     p50 = pd.DataFrame(fcsts['Forecast']['Predictions']['p50'])
     p90 = pd.DataFrame(fcsts['Forecast']['Predictions']['p90'])
     pred_int = p50['Timestamp'].apply(lambda x: pd.Timestamp(x))
+    p50['Timestamp'] = pred_int
     fcst_start_date = pred_int.iloc[0]
     fcst_end_date = pred_int.iloc[-1]
-    time_int = exact['timestamp'].apply(lambda x: pd.Timestamp(x))
-    plt.plot(time_int[(time_back if reverse else -time_back):],exact[target_col_name].values[(time_back if reverse else -time_back):], color = 'r')
-    plt.plot(pred_int, p50['Value'].values, color = 'k')
-    plt.fill_between(pred_int, 
+    tb = exact.head(time_back) if reverse else exact.tail(time_back)
+    tb.drop(["item_id"], axis=1, inplace=True)
+    tb.rename(columns={'timestamp': 'Timestamp', target_col_name: 'Value'}, inplace=True)
+    time_int = tb['Timestamp'].apply(lambda x: pd.Timestamp(x))
+    tb['Timestamp'] = time_int
+    final = pd.concat([p50, tb], ignore_index=True).sort_values('Timestamp', ignore_index=True)
+    plt.plot(final['Timestamp'].values, final['Value'].values, color = 'k')
+    plt.fill_between(pred_int,
                      p10['Value'].values,
                      p90['Value'].values,
-                     color='b', alpha=0.3)
-    plt.axvline(x=pd.Timestamp(fcst_start_date), linewidth=3, color='g', ls='dashed')
-    plt.axvline(x=pd.Timestamp(fcst_end_date), linewidth=3, color='g', ls='dashed')
+                     color='b', alpha=0.3);
+    plt.axvline(x=pd.Timestamp(fcst_start_date), linewidth=1, color='g', ls='dashed')
+    plt.axvline(x=pd.Timestamp(fcst_end_date), linewidth=1, color='g', ls='dashed')
     plt.xticks(rotation=30)
     plt.legend(['Target', 'Forecast'], loc = 'lower left')
+
+
+def plot_bokeh_forecasts(fcsts, exact, freq = '1D', forecastHorizon=30, time_back = 30, target_col_name='target', reverse=False):
+    p10 = pd.DataFrame(fcsts['Forecast']['Predictions']['p10'])
+    p50 = pd.DataFrame(fcsts['Forecast']['Predictions']['p50'])
+    p90 = pd.DataFrame(fcsts['Forecast']['Predictions']['p90'])
+    pred_int = p50['Timestamp'].apply(lambda x: pd.Timestamp(x))
+    p50['Timestamp'] = pred_int
+    fcst_start_date = pred_int.iloc[0]
+    fcst_end_date = pred_int.iloc[-1]
+    tb = exact.head(time_back) if reverse else exact.tail(time_back)
+    tb.drop(["item_id"], axis=1, inplace=True)
+    tb.rename(columns={'timestamp': 'Timestamp', target_col_name: 'Value'}, inplace=True)
+    time_int = tb['Timestamp'].apply(lambda x: pd.Timestamp(x))
+    tb['Timestamp'] = time_int
+    final = pd.concat([p50, tb], ignore_index=True).sort_values('Timestamp', ignore_index=True)
+
+    hover = HoverTool(tooltips=[('Timestamp', '@Timestamp{%F}'), ('Value', '$@Value{0,0.00}')],
+                      formatters={'@Timestamp': 'datetime'},
+                      mode='vline'
+                     )
+    crosshair = CrosshairTool()
+    tools = (hover, crosshair)
+
+    source = ColumnDataSource(final)
+    plot = figure(title="Stock Price Forecast", x_axis_label='Timestamp', y_axis_label='Stock Value', sizing_mode='stretch_width')
+
+    main = plot.line(x='Timestamp', y='Value', source=source, line_width=2)
+    plot.add_tools(*tools)
+    plot.yaxis[0].formatter = NumeralTickFormatter(format="$0.00")
+    plot.xaxis[0].formatter = DatetimeTickFormatter(hours="%d %b %Y",
+                                                 days="%d %b %Y",
+                                                 months="%d %b %Y",
+                                                 years="%d %b %Y",
+                                                )
+    plot.xaxis[0].major_label_orientation = math.pi/3
+    plot.varea(pred_int, p10['Value'].values, p90['Value'].values, fill_color=("blue"), fill_alpha=0.3)
+    plot.vspan(x=pd.Timestamp(fcst_start_date), line_color="green", line_width=3, line_dash='dashed')
+    plot.vspan(x=pd.Timestamp(fcst_end_date), line_color="green", line_width=3, line_dash='dashed')
+    hover.renderers = [main]
+    return plot
 
 
 def extract_gz( src, dst ):

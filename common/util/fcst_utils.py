@@ -286,7 +286,7 @@ def get_or_create_bucket(bucket_name, region=None):
     return bucket_name
 
 
-def plot_forecasts(fcsts, exact, freq = '1D', forecastHorizon=30, time_back = 30, future=None, target_col_name='target', reverse=False):
+def plot_forecasts(fcsts, exact, freq = '1D', forecastHorizon=30, time_back = 30, future=pd.DataFrame(), target_col_name='target', reverse=False):
     p10 = pd.DataFrame(fcsts['Forecast']['Predictions']['p10'])
     p50 = pd.DataFrame(fcsts['Forecast']['Predictions']['p50'])
     p90 = pd.DataFrame(fcsts['Forecast']['Predictions']['p90'])
@@ -309,6 +309,10 @@ def plot_forecasts(fcsts, exact, freq = '1D', forecastHorizon=30, time_back = 30
     plt.axvline(x=pd.Timestamp(fcst_end_date), linewidth=1, color='g', ls='dashed')
     plt.xticks(rotation=30)
     plt.legend(['Target', 'Forecast'], loc = 'lower left')
+    
+    if not future.empty:
+        future_df = future.rename(columns={'timestamp': 'Timestamp', target_col_name: 'Value'})
+        plt.plot(future_df['Timestamp'].values, future_df['Value'].values, color = 'r')
 
 
 def plot_bokeh_forecasts(fcsts, exact, freq = '1D', forecastHorizon=30, time_back = 30, future=pd.DataFrame(), target_col_name='target', reverse=False):

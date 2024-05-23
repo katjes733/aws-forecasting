@@ -4,6 +4,7 @@ import gzip
 import re
 import math
 from datetime import datetime
+from pathlib import Path
 
 import boto3
 import botocore.exceptions
@@ -192,6 +193,37 @@ def delete_dataset(arn, forecast):
     delete_dataset_import_jobs(arn, forecast)
     print(f"Deleting dataset: {arn}")
     util.wait_till_delete(lambda: forecast.delete_dataset(DatasetArn=arn))
+
+
+def prepare_data(bucket_name, data_key, date_format, target_column_name, item_id, fill_missing_values=False, minimal=False, start_date=None, end_date=None):
+    df = pd.read_csv(f"s3://{bucket_name}/{data_key}", dtype=object)
+    df.drop(["Vol.", "Change %"], axis=1, inplace=True)
+    df["Date"] = pd.to_datetime(df["Date"], format=date_format).dt.date
+    df[["Price", "Open", "High", "Low"]] = df[["Price", "Open", "High", "Low"]].astype(float)
+    df.rename(columns={'Date': 'datetime', 'Price': target_column_name, 'Open': 'open', 'High': 'high', 'Low': 'low'}, inplace=True)
+    df["item_id"] = item_id
+    
+    if start_date and end_date:
+        mask = (df['datetime'] >= start_date.to_pydatetime().date()) & (df['datetime'] <= end_date.to_pydatetime().date())
+        df = df.loc[mask]
+    elif start_date and not end_date:
+        mask = (df['datetime'] >= start_date.to_pydatetime().date())
+        df = df.loc[mask]
+    elif not start_date and end_date:
+        mask = (df['datetime'] <= end_date.to_pydatetime().date())
+        df = df.loc[mask]
+
+    if fill_missing_values:
+        new_index = pd.Index(pd.date_range(df.datetime.min(), df.datetime.max()), name="datetime")
+        df.set_index("datetime").reindex(new_index)
+        df = df.set_index("datetime").reindex(new_index).reset_index().ffill()
+        df = df.sort_values(by=['datetime'], ascending=False, ignore_index=True)
+
+    if minimal:
+        df.drop(["open", "high", "low"], axis=1, inplace=True)
+        df.rename(columns={'datetime': 'timestamp'}, inplace=True)
+
+    return df
 
 
 def load_exact_sol(fname, item_id, is_schema_perm=False, target_col_name='target'):

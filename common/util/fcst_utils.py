@@ -341,7 +341,7 @@ def plot_forecasts(fcsts, exact, freq = '1D', forecastHorizon=30, time_back = 30
     plt.axvline(x=pd.Timestamp(fcst_end_date), linewidth=1, color='g', ls='dashed')
     plt.xticks(rotation=30)
     plt.legend(['Target', 'Forecast'], loc = 'lower left')
-    
+
     if not future.empty:
         future_df = future.rename(columns={'timestamp': 'Timestamp', target_col_name: 'Value'})
         plt.plot(future_df['Timestamp'].values, future_df['Value'].values, color = 'r')

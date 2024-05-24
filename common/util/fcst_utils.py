@@ -64,7 +64,7 @@ def create_forecast_name(prefix, algorithm, date_format=default_df):
 
 def create_forecast(forecast_name, forecast_name_unique, predictor_arn, forecast_client, tags=[], ui_date_format=default_ui_df):
     existing_forecasts = util.get_forecasts(forecast_name, forecast_client, False)
-    
+
     if len(existing_forecasts) > 0:
         print(f"Forecasts exist with the latest one from {existing_forecasts[0]['CreationTime'].strftime(ui_date_format)}.")
         if not input("Create new forecast (y/N)? ").lower() == "y":
@@ -76,17 +76,17 @@ def create_forecast(forecast_name, forecast_name_unique, predictor_arn, forecast
                                                               )
     forecast_arn = create_forecast_response['ForecastArn']
     print(f"Creating new forecast {forecast_arn} for predictor {predictor_arn}...")
-    status = util.wait(lambda: forecast.describe_forecast(ForecastArn=forecast_arn))
+    status = util.wait(lambda: forecast_client.describe_forecast(ForecastArn=forecast_arn))
     assert status
-    
+
     return forecast_arn
 
 
-def get_forecasts(forecast_name, forecast, exact=True):
+def get_forecasts(forecast_name, forecast_client, exact=True):
     args = {}
     forecasts = []
     while True:
-        response = forecast.list_forecasts(**args)
+        response = forecast_client.list_forecasts(**args)
         for one_forecast in response["Forecasts"]:
             if exact and one_forecast["ForecastName"] == forecast_name:
                 forecasts.append(one_forecast)
@@ -124,19 +124,19 @@ def delete_forecasts_by_predictor(predictor_arn, forecast_client, exact=True):
         util.wait_till_delete(lambda: forecast_client.delete_forecast(ForecastArn=one_forecast["ForecastArn"]))
 
 
-def get_predictor(predictor_name, forecast, exact=True):
-    predictors = get_predictors(predictor_name, forecast, exact)
+def get_predictor(predictor_name, forecast_client, exact=True):
+    predictors = get_predictors(predictor_name, forecast_client, exact)
     if len(predictors) == 0:
         return None
     else:
         return predictors[0]
 
 
-def get_predictors(predictor_name, forecast, exact=True):
+def get_predictors(predictor_name, forecast_client, exact=True):
     args = {}
     predictors = []
     while True:
-        response = forecast.list_predictors(**args)
+        response = forecast_client.list_predictors(**args)
         for one_predictor in response["Predictors"]:
             if exact and one_predictor["PredictorName"] == predictor_name:
                 predictors.append(one_predictor)
@@ -150,15 +150,15 @@ def get_predictors(predictor_name, forecast, exact=True):
     return predictors
 
 
-def get_dataset_import_jobs(dataset_arn, forecast):
-    dataset_name = re.search(r"^.*?dataset/(?P<dataset_name>.*)$", dataset_arn, re.M).group("dataset_name")
+def get_dataset_import_jobs(dataset_arn, forecast_client):
+    dataset_name = re.search(r"^.*?dataset/(?P<dataset_name>[a-zA-Z0-9_]+)$", dataset_arn, re.M).group("dataset_name")
 
     args = {}
     dataset_import_jobs = []
     while True:
-        response = forecast.list_dataset_import_jobs(**args)
+        response = forecast_client.list_dataset_import_jobs(**args)
         for dataset_import_job in response["DatasetImportJobs"]:
-            dataset_name_from_arn = re.search("^.*?dataset-import-job/(?P<dataset_import_job_name>.*?)/.*$", dataset_import_job["DatasetImportJobArn"], re.M).group("dataset_import_job_name")
+            dataset_name_from_arn = re.search("^.*?dataset-import-job/(?P<dataset_import_job_name>[a-zA-Z0-9_]+?)/.*$", dataset_import_job["DatasetImportJobArn"], re.M).group("dataset_import_job_name")
             if dataset_name_from_arn == dataset_name:
                 dataset_import_jobs.append(dataset_import_job)
         if "NextToken" in response and response["NextToken"]:
@@ -168,31 +168,42 @@ def get_dataset_import_jobs(dataset_arn, forecast):
     return dataset_import_jobs
 
 
-def delete_predictors():
-    None
+def delete_predictor(predictor_arn: str, forecast_client):
+    print(f"Deleting predictor {predictor_arn}...")
+    wait_till_delete(lambda: forecast_client.delete_predictor(PredictorArn=predictor_arn))
 
 
-def delete_dataset_group(arn, forecast):
+def delete_predictors(dataset_group_arn: str, forecast_client):
+    dataset_group_name = re.search(r"^.*?dataset-group/(?P<dataset_group_name>[a-zA-Z0-9_]+)$", dataset_group_arn, re.M).group("dataset_group_name")
+    for predictor in get_predictors(dataset_group_name, forecast_client, exact=False):
+        delete_forecasts_by_predictor(predictor["PredictorArn"], forecast_client)
+        delete_predictor(predictor["PredictorArn"], forecast_client)
+
+
+def delete_dataset_group(dataset_group_arn: str, forecast_client):
     try:
-        response = forecast.describe_dataset_group(DatasetGroupArn=arn)
+        response = forecast_client.describe_dataset_group(DatasetGroupArn=dataset_group_arn)
+        
+        delete_predictors(dataset_group_arn, forecast_client)
+        
         for dataset_arn in response["DatasetArns"]:
-            delete_dataset(dataset_arn, forecast)
-        print(f"Deleting dataset_group: {arn}")
-        wait_till_delete(lambda: forecast.delete_dataset_group(DatasetGroupArn=arn))
-    except forecast.exceptions.ResourceNotFoundException:
-        print(f"Dataset with ARN '{arn}' does not exist.")
+            delete_dataset(dataset_arn, forecast_client)
+        print(f"Deleting dataset_group {dataset_group_arn}...")
+        wait_till_delete(lambda: forecast_client.delete_dataset_group(DatasetGroupArn=dataset_group_arn))
+    except forecast_client.exceptions.ResourceNotFoundException:
+        print(f"Dataset with ARN '{dataset_group_arn}' does not exist.")
 
 
-def delete_dataset_import_jobs(dataset_arn, forecast):
-    for dataset_import_job in get_dataset_import_jobs(dataset_arn, forecast):
+def delete_dataset_import_jobs(dataset_arn, forecast_client):
+    for dataset_import_job in get_dataset_import_jobs(dataset_arn, forecast_client):
         print(f"Deleting dataset_import_job: {dataset_import_job['DatasetImportJobArn']}")
-        wait_till_delete(lambda: forecast.delete_dataset_import_job(DatasetImportJobArn=dataset_import_job["DatasetImportJobArn"]))
+        wait_till_delete(lambda: forecast_client.delete_dataset_import_job(DatasetImportJobArn=dataset_import_job["DatasetImportJobArn"]))
 
 
-def delete_dataset(arn, forecast):
-    delete_dataset_import_jobs(arn, forecast)
+def delete_dataset(arn, forecast_client):
+    delete_dataset_import_jobs(arn, forecast_client)
     print(f"Deleting dataset: {arn}")
-    util.wait_till_delete(lambda: forecast.delete_dataset(DatasetArn=arn))
+    util.wait_till_delete(lambda: forecast_client.delete_dataset(DatasetArn=arn))
 
 
 def prepare_data(bucket_name, data_key, date_format, target_column_name, item_id, fill_missing_values=False, minimal=False, start_date=None, end_date=None):
@@ -202,7 +213,7 @@ def prepare_data(bucket_name, data_key, date_format, target_column_name, item_id
     df[["Price", "Open", "High", "Low"]] = df[["Price", "Open", "High", "Low"]].astype(float)
     df.rename(columns={'Date': 'datetime', 'Price': target_column_name, 'Open': 'open', 'High': 'high', 'Low': 'low'}, inplace=True)
     df["item_id"] = item_id
-    
+
     if start_date and end_date:
         mask = (df['datetime'] >= start_date.to_pydatetime().date()) & (df['datetime'] <= end_date.to_pydatetime().date())
         df = df.loc[mask]
@@ -221,14 +232,63 @@ def prepare_data(bucket_name, data_key, date_format, target_column_name, item_id
 
     if minimal:
         df.drop(["open", "high", "low"], axis=1, inplace=True)
-        df.rename(columns={'datetime': 'timestamp'}, inplace=True)
+
+    df.rename(columns={'datetime': 'timestamp'}, inplace=True)
 
     return df
 
 
+def is_excluded(obj: str, exclude: list[str]=[]):
+    if not exclude:
+        return False
+
+    for one_exclude in exclude:
+        if one_exclude in obj:
+            return True
+
+    return False
+
+
+def get_related_data(s3_client, bucket: str, prefix: str, target_df, target_column_name:str, item_id: str, exclude: list[str]=[], start_date=None, end_date=None):
+    object_prefix = prefix if prefix.endswith('/') else f"{prefix}/"
+
+    args = {
+        "Bucket": bucket,
+        "Prefix": object_prefix
+    }
+    related_data_csv_objects = {}
+    while True:
+        response = s3_client.list_objects_v2(**args)
+        list_related_data_csv_objects = list(filter(lambda obj: obj != object_prefix and not is_excluded(obj, exclude), list(map(lambda obj: obj["Key"], response["Contents"]))))
+        related_data_csv_objects = { Path(obj).stem.lower(): obj for obj in list_related_data_csv_objects }
+        if "NextContinuationToken" in response:
+            args["ContinuationToken"] = response["NextContinuationToken"]
+        else:
+            break
+
+    relevant_target_df_columns = list(filter(lambda col: col != target_column_name, target_df.columns))
+
+    related_stocks_merged_df = target_df[list(filter(lambda col: col != target_column_name, target_df.columns))].set_index("timestamp")
+    for key in related_data_csv_objects:
+        related_stock_df = prepare_data(
+            bucket,
+            related_data_csv_objects[key],
+            "%m/%d/%Y",
+            target_column_name,
+            key,
+            fill_missing_values=True,
+            start_date=start_date,
+            end_date=end_date
+        )[["timestamp", target_column_name]].rename(columns={target_column_name: f"{key}_{target_column_name}"}).set_index("timestamp")
+
+        related_stocks_merged_df = related_stocks_merged_df.join(related_stock_df)
+
+    return related_stocks_merged_df.reset_index()
+
+
 def load_exact_sol(fname, item_id, is_schema_perm=False, target_col_name='target'):
     exact = pd.read_csv(fname, header=None)
-    exact.columns = ['item_id', 'timestamp', target_col_name]
+    exact.columns = ['timestamp', 'item_id', target_col_name]
     if is_schema_perm:
         exact.columns = ['timestamp', target_col_name, 'item_id']
     return exact.loc[exact['item_id'] == item_id]
@@ -258,7 +318,7 @@ def get_or_create_iam_role( role_name ):
         )
         role_arn = create_role_response["Role"]["Arn"]
         print("Created", role_arn)
-        
+
         print("Attaching policies...")
         iam.attach_role_policy(
             RoleName = role_name,
@@ -404,3 +464,37 @@ def extract_gz( src, dst ):
             fd_dst.write(data)
 
     print("Done.")
+
+
+def get_attributes_by_domain(domain: str):
+    match domain:
+        case "RETAIL":
+            return {"AttributeName": "demand", "AttributeType": "float"}
+        case "CUSTOM":
+            return {"AttributeName": "target_value", "AttributeType": "integer"}
+        case "INVENTORY_PLANNING":
+            return {"AttributeName": "demand", "AttributeType": "float"}
+        case "EC2_CAPACITY":
+            return {"AttributeName": "number_of_instances", "AttributeType": "integer"}
+        case "WORK_FORCE":
+            return {"AttributeName": "workforce_demand", "AttributeType": "integer"}
+        case "WEB_TRAFFIC":
+            return {"AttributeName": "value", "AttributeType": "float"}
+        case "METRICS":
+            return {"AttributeName": "metric_value", "AttributeType": "integer"}
+        case _:
+            raise ValueError(f"domain must be 'RETAIL'|'CUSTOM'|'INVENTORY_PLANNING'|'EC2_CAPACITY'|'WORK_FORCE'|'WEB_TRAFFIC'|'METRICS', but was {domain}")
+
+
+def get_schema_attributes(df, domain: str, target_column_name: str):
+    attributes = []
+    for one_column in df:
+        if one_column == target_column_name:
+            attributes.append(get_attributes_by_domain(domain))
+        elif one_column == "item_id":
+            attributes.append({"AttributeName": "item_id", "AttributeType": "string"})
+        elif one_column == "timestamp":
+            attributes.append({"AttributeName": "timestamp", "AttributeType": "timestamp"})
+        else:
+            attributes.append({"AttributeName": f"{one_column}_value", "AttributeType": "float"})
+    return attributes

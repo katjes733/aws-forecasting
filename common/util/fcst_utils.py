@@ -379,9 +379,9 @@ def get_or_create_bucket(bucket_name, region=None):
 
 
 def plot_forecasts(fcsts, exact, freq = '1D', forecastHorizon=30, time_back = 30, future=pd.DataFrame(), target_col_name='target', reverse=False):
-    p10 = pd.DataFrame(fcsts['Forecast']['Predictions']['p10'])
-    p50 = pd.DataFrame(fcsts['Forecast']['Predictions']['p50'])
-    p90 = pd.DataFrame(fcsts['Forecast']['Predictions']['p90'])
+    p10 = pd.DataFrame(fcsts['Predictions']['p10'])
+    p50 = pd.DataFrame(fcsts['Predictions']['p50'])
+    p90 = pd.DataFrame(fcsts['Predictions']['p90'])
     pred_int = p50['Timestamp'].apply(lambda x: pd.Timestamp(x))
     p50['Timestamp'] = pred_int
     fcst_start_date = pred_int.iloc[0]
@@ -407,10 +407,10 @@ def plot_forecasts(fcsts, exact, freq = '1D', forecastHorizon=30, time_back = 30
         plt.plot(future_df['Timestamp'].values, future_df['Value'].values, color = 'r')
 
 
-def plot_bokeh_forecasts(fcsts, exact, freq = '1D', forecastHorizon=30, time_back = 30, future=pd.DataFrame(), target_col_name='target', reverse=False):
-    p10 = pd.DataFrame(fcsts['Forecast']['Predictions']['p10'])
-    p50 = pd.DataFrame(fcsts['Forecast']['Predictions']['p50'])
-    p90 = pd.DataFrame(fcsts['Forecast']['Predictions']['p90'])
+def plot_bokeh_forecasts(fcsts, exact, freq = '1D', forecastHorizon=30, time_back = 30, future=pd.DataFrame(), target_col_name='target', reverse=False, title="Stock Price Forecast"):
+    p10 = pd.DataFrame(fcsts['Predictions']['p10'])
+    p50 = pd.DataFrame(fcsts['Predictions']['p50'])
+    p90 = pd.DataFrame(fcsts['Predictions']['p90'])
     pred_int = p50['Timestamp'].apply(lambda x: pd.Timestamp(x))
     p50['Timestamp'] = pred_int
     fcst_start_date = pred_int.iloc[0]
@@ -430,7 +430,7 @@ def plot_bokeh_forecasts(fcsts, exact, freq = '1D', forecastHorizon=30, time_bac
     tools = (hover, crosshair)
 
     source = ColumnDataSource(final)
-    plot = figure(title="Stock Price Forecast", x_axis_label='Timestamp', y_axis_label='Stock Value', sizing_mode='stretch_width')
+    plot = figure(title=title, x_axis_label='Timestamp', y_axis_label='Stock Value', sizing_mode='stretch_width')
 
     main = plot.line(x='Timestamp', y='Value', source=source, line_width=2)
     plot.add_tools(*tools)

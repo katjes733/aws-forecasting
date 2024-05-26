@@ -183,9 +183,9 @@ def delete_predictors(dataset_group_arn: str, forecast_client):
 def delete_dataset_group(dataset_group_arn: str, forecast_client):
     try:
         response = forecast_client.describe_dataset_group(DatasetGroupArn=dataset_group_arn)
-        
+
         delete_predictors(dataset_group_arn, forecast_client)
-        
+
         for dataset_arn in response["DatasetArns"]:
             delete_dataset(dataset_arn, forecast_client)
         print(f"Deleting dataset_group {dataset_group_arn}...")
@@ -207,10 +207,10 @@ def delete_dataset(arn, forecast_client):
 
 
 def prepare_data(bucket_name, data_key, date_format, target_column_name, item_id, fill_missing_values=False, minimal=False, start_date=None, end_date=None):
-    df = pd.read_csv(f"s3://{bucket_name}/{data_key}", dtype=object)
+    df = pd.read_csv(f"s3://{bucket_name}/{data_key}", dtype=object, thousands=',')
     df.drop(["Vol.", "Change %"], axis=1, inplace=True)
     df["Date"] = pd.to_datetime(df["Date"], format=date_format).dt.date
-    df[["Price", "Open", "High", "Low"]] = df[["Price", "Open", "High", "Low"]].astype(float)
+    df[["Price", "Open", "High", "Low"]] = df[["Price", "Open", "High", "Low"]].replace(',', '', regex=True).astype(float)
     df.rename(columns={'Date': 'datetime', 'Price': target_column_name, 'Open': 'open', 'High': 'high', 'Low': 'low'}, inplace=True)
     df["item_id"] = item_id
 
@@ -224,11 +224,20 @@ def prepare_data(bucket_name, data_key, date_format, target_column_name, item_id
         mask = (df['datetime'] <= end_date.to_pydatetime().date())
         df = df.loc[mask]
 
+    df["bank_day"] = 1
+
     if fill_missing_values:
         new_index = pd.Index(pd.date_range(df.datetime.min(), df.datetime.max()), name="datetime")
         df.set_index("datetime").reindex(new_index)
-        df = df.set_index("datetime").reindex(new_index).reset_index().ffill()
+        df = df.set_index("datetime").reindex(new_index).reset_index()
+        for col in df.columns:
+            if col == "bank_day":
+                df.fillna({col: 0}, inplace=True)
+            else:
+                df[col] = df[col].ffill()
         df = df.sort_values(by=['datetime'], ascending=False, ignore_index=True)
+
+    df["bank_day"] = pd.to_numeric(df["bank_day"]).astype("Int32")
 
     if minimal:
         df.drop(["open", "high", "low"], axis=1, inplace=True)
@@ -249,7 +258,7 @@ def is_excluded(obj: str, exclude: list[str]=[]):
     return False
 
 
-def get_related_data(s3_client, bucket: str, prefix: str, target_df, target_column_name:str, item_id: str, exclude: list[str]=[], start_date=None, end_date=None):
+def get_related_data(s3_client, bucket: str, prefix: str, target_df, target_column_name:str, item_id: str, exclude: list[str]=[], start_date=None, end_date=None, extra_features=True):
     object_prefix = prefix if prefix.endswith('/') else f"{prefix}/"
 
     args = {
@@ -268,7 +277,8 @@ def get_related_data(s3_client, bucket: str, prefix: str, target_df, target_colu
 
     relevant_target_df_columns = list(filter(lambda col: col != target_column_name, target_df.columns))
 
-    related_stocks_merged_df = target_df[list(filter(lambda col: col != target_column_name, target_df.columns))].set_index("timestamp")
+    related_stocks_merged_df = target_df[relevant_target_df_columns].set_index("timestamp") if extra_features else target_df[["timestamp", "item_id", "bank_day"]].set_index("timestamp")
+
     for key in related_data_csv_objects:
         related_stock_df = prepare_data(
             bucket,
@@ -287,7 +297,7 @@ def get_related_data(s3_client, bucket: str, prefix: str, target_df, target_colu
 
 
 def load_exact_sol(fname, item_id, is_schema_perm=False, target_col_name='target'):
-    exact = pd.read_csv(fname, header=None)
+    exact = pd.read_csv(fname, header=None, thousands=',')
     exact.columns = ['timestamp', 'item_id', target_col_name]
     if is_schema_perm:
         exact.columns = ['timestamp', target_col_name, 'item_id']
@@ -492,9 +502,30 @@ def get_schema_attributes(df, domain: str, target_column_name: str):
         if one_column == target_column_name:
             attributes.append(get_attributes_by_domain(domain))
         elif one_column == "item_id":
-            attributes.append({"AttributeName": "item_id", "AttributeType": "string"})
+            attributes.append({"AttributeName": one_column, "AttributeType": "string"})
         elif one_column == "timestamp":
-            attributes.append({"AttributeName": "timestamp", "AttributeType": "timestamp"})
+            attributes.append({"AttributeName": one_column, "AttributeType": "timestamp"})
+        elif one_column == "bank_day":
+            attributes.append({"AttributeName": one_column, "AttributeType": "integer"})
         else:
             attributes.append({"AttributeName": f"{one_column}_value", "AttributeType": "float"})
     return attributes
+
+
+def get_relevant_forecasts(forecast_name_prefix, data_version, algorithm, forecast_client):
+    relevant_forecasts = {}
+    for version in range(data_version + 1):
+        forecasts = util.get_forecasts_by_predictor(f"{forecast_name_prefix}{version}_{algorithm}".replace("-", "_"), forecast_client, exact=False)
+        if len(forecasts) > 0:
+            relevant_forecasts[version] = forecasts[0]["ForecastArn"]
+    return relevant_forecasts
+
+
+def query_forecasts(forecasts, item_id: str, forecastquery_client):
+    query_results = {}
+    for key in forecasts:
+        forecast_response = forecastquery_client.query_forecast(
+            ForecastArn=forecasts[key],
+            Filters={"item_id": item_id})
+        query_results[key] = forecast_response["Forecast"]
+    return query_results

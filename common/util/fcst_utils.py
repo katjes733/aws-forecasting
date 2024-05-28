@@ -11,6 +11,8 @@ import botocore.exceptions
 
 import pandas as pd
 import matplotlib.pyplot as plt
+import numpy as np
+from scipy import stats
 
 from bokeh.plotting import figure
 from bokeh.models import ColumnDataSource, NumeralTickFormatter, DatetimeTickFormatter
@@ -206,43 +208,52 @@ def delete_dataset(arn, forecast_client):
     util.wait_till_delete(lambda: forecast_client.delete_dataset(DatasetArn=arn))
 
 
-def prepare_data(bucket_name, data_key, date_format, target_column_name, item_id, fill_missing_values=False, minimal=False, start_date=None, end_date=None):
+def prepare_data(bucket_name,
+                 data_key,
+                 date_format,
+                 target_column_name,
+                 item_id,
+                 fill_missing_values=False,
+                 use_bank_day=False,
+                 minimal=False,
+                 start_date=None,
+                 end_date=None):
     df = pd.read_csv(f"s3://{bucket_name}/{data_key}", dtype=object, thousands=',')
     df.drop(["Vol.", "Change %"], axis=1, inplace=True)
     df["Date"] = pd.to_datetime(df["Date"], format=date_format).dt.date
     df[["Price", "Open", "High", "Low"]] = df[["Price", "Open", "High", "Low"]].replace(',', '', regex=True).astype(float)
-    df.rename(columns={'Date': 'datetime', 'Price': target_column_name, 'Open': 'open', 'High': 'high', 'Low': 'low'}, inplace=True)
+    df.rename(columns={'Date': 'timestamp', 'Price': target_column_name, 'Open': 'open', 'High': 'high', 'Low': 'low'}, inplace=True)
     df["item_id"] = item_id
 
     if start_date and end_date:
-        mask = (df['datetime'] >= start_date.to_pydatetime().date()) & (df['datetime'] <= end_date.to_pydatetime().date())
+        mask = (df['timestamp'] >= (start_date.to_pydatetime().date() if fill_missing_values else start_date)) & (df['timestamp'] <= (end_date.to_pydatetime().date() if fill_missing_values else end_date))
         df = df.loc[mask]
     elif start_date and not end_date:
-        mask = (df['datetime'] >= start_date.to_pydatetime().date())
+        mask = (df['timestamp'] >= start_date.to_pydatetime().date())
         df = df.loc[mask]
     elif not start_date and end_date:
-        mask = (df['datetime'] <= end_date.to_pydatetime().date())
+        mask = (df['timestamp'] <= end_date.to_pydatetime().date())
         df = df.loc[mask]
 
-    df["bank_day"] = 1
+    if use_bank_day:
+        df["bank_day"] = 1
 
     if fill_missing_values:
-        new_index = pd.Index(pd.date_range(df.datetime.min(), df.datetime.max()), name="datetime")
-        df.set_index("datetime").reindex(new_index)
-        df = df.set_index("datetime").reindex(new_index).reset_index()
+        new_index = pd.Index(pd.date_range(df.timestamp.min(), df.timestamp.max()), name="timestamp")
+        df.set_index("timestamp").reindex(new_index)
+        df = df.set_index("timestamp").reindex(new_index).reset_index()
         for col in df.columns:
-            if col == "bank_day":
+            if use_bank_day and col == "bank_day":
                 df.fillna({col: 0}, inplace=True)
             else:
                 df[col] = df[col].ffill()
-        df = df.sort_values(by=['datetime'], ascending=False, ignore_index=True)
+        df = df.sort_values(by=['timestamp'], ascending=False, ignore_index=True)
 
-    df["bank_day"] = pd.to_numeric(df["bank_day"]).astype("Int32")
+    if use_bank_day:
+        df["bank_day"] = pd.to_numeric(df["bank_day"]).astype("Int32")
 
     if minimal:
         df.drop(["open", "high", "low"], axis=1, inplace=True)
-
-    df.rename(columns={'datetime': 'timestamp'}, inplace=True)
 
     return df
 
@@ -258,7 +269,18 @@ def is_excluded(obj: str, exclude: list[str]=[]):
     return False
 
 
-def get_related_data(s3_client, bucket: str, prefix: str, target_df, target_column_name:str, item_id: str, exclude: list[str]=[], start_date=None, end_date=None, extra_features=True):
+def get_related_data(s3_client,
+                     bucket: str,
+                     prefix: str,
+                     target_df,
+                     target_column_name:str,
+                     item_id: str,
+                     exclude: list[str]=[],
+                     fill_missing_values=False,
+                     use_bank_day=False,
+                     extra_features=True,
+                     start_date=None,
+                     end_date=None):
     object_prefix = prefix if prefix.endswith('/') else f"{prefix}/"
 
     args = {
@@ -275,9 +297,14 @@ def get_related_data(s3_client, bucket: str, prefix: str, target_df, target_colu
         else:
             break
 
-    relevant_target_df_columns = list(filter(lambda col: col != target_column_name, target_df.columns))
+    if extra_features:
+        relevant_target_df_columns = list(filter(lambda col: col != target_column_name, target_df.columns))
+    else:
+        relevant_target_df_columns = ["timestamp", "item_id"]
+        if use_bank_day:
+            relevant_target_df_columns.append("bank_day")
 
-    related_stocks_merged_df = target_df[relevant_target_df_columns].set_index("timestamp") if extra_features else target_df[["timestamp", "item_id", "bank_day"]].set_index("timestamp")
+    related_stocks_merged_df = target_df[relevant_target_df_columns].set_index("timestamp")
 
     for key in related_data_csv_objects:
         related_stock_df = prepare_data(
@@ -286,7 +313,8 @@ def get_related_data(s3_client, bucket: str, prefix: str, target_df, target_colu
             "%m/%d/%Y",
             target_column_name,
             key,
-            fill_missing_values=True,
+            fill_missing_values=fill_missing_values,
+            use_bank_day=use_bank_day,
             start_date=start_date,
             end_date=end_date
         )[["timestamp", target_column_name]].rename(columns={target_column_name: f"{key}_{target_column_name}"}).set_index("timestamp")
@@ -417,10 +445,10 @@ def plot_forecasts(fcsts, exact, freq = '1D', forecastHorizon=30, time_back = 30
         plt.plot(future_df['Timestamp'].values, future_df['Value'].values, color = 'r')
 
 
-def plot_bokeh_forecasts(fcsts, exact, freq = '1D', forecastHorizon=30, time_back = 30, future=pd.DataFrame(), target_col_name='target', reverse=False, title="Stock Price Forecast"):
-    p10 = pd.DataFrame(fcsts['Predictions']['p10'])
-    p50 = pd.DataFrame(fcsts['Predictions']['p50'])
-    p90 = pd.DataFrame(fcsts['Predictions']['p90'])
+def plot_bokeh_forecasts(forecast_dfs, exact, freq = '1D', forecastHorizon=30, time_back = 30, future=pd.DataFrame(), target_col_name='target', reverse=False, title="Stock Price Forecast"):
+    p10 = forecast_dfs['p10']
+    p50 = forecast_dfs['p50']
+    p90 = forecast_dfs['p90']
     pred_int = p50['Timestamp'].apply(lambda x: pd.Timestamp(x))
     p50['Timestamp'] = pred_int
     fcst_start_date = pred_int.iloc[0]
@@ -529,3 +557,17 @@ def query_forecasts(forecasts, item_id: str, forecastquery_client):
             Filters={"item_id": item_id})
         query_results[key] = forecast_response["Forecast"]
     return query_results
+
+
+def query_results_to_dataframes(query_results, fill_missing_values=False):
+    results = {}
+    for version in query_results:
+        dataframes = {}
+        query_result = query_results[version]["Predictions"]
+        for key in query_result:
+            df = pd.DataFrame(query_result[key])
+            if not fill_missing_values:
+                df = df[(df['Value'].abs() > 0.1)]
+            dataframes[key] = df
+        results[version] = dataframes
+    return results

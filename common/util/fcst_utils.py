@@ -10,6 +10,7 @@ import boto3
 import botocore.exceptions
 
 import pandas as pd
+from pandas.tseries.holiday import USFederalHolidayCalendar as calendar
 import matplotlib.pyplot as plt
 import numpy as np
 from scipy import stats
@@ -566,8 +567,10 @@ def query_results_to_dataframes(query_results, fill_missing_values=False):
         query_result = query_results[version]["Predictions"]
         for key in query_result:
             df = pd.DataFrame(query_result[key])
+            df["Timestamp"] = pd.to_datetime(df["Timestamp"])
             if not fill_missing_values:
-                df = df[(df['Value'].abs() > 0.1)]
+                holidays = calendar().holidays(start=df["Timestamp"].min(), end=df["Timestamp"].max())
+                df = df[(df["Timestamp"].dt.dayofweek < 5) & (~df["Timestamp"].isin(holidays))]
             dataframes[key] = df
         results[version] = dataframes
     return results

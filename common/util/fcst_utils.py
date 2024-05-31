@@ -12,8 +12,6 @@ import botocore.exceptions
 import pandas as pd
 from pandas.tseries.holiday import USFederalHolidayCalendar as calendar
 import matplotlib.pyplot as plt
-import numpy as np
-from scipy import stats
 
 from bokeh.plotting import figure
 from bokeh.models import ColumnDataSource, NumeralTickFormatter, DatetimeTickFormatter
@@ -25,7 +23,7 @@ default_df = '%Y%m%d_%H%M%S'
 default_ui_df = '%a, %d %b %Y %H:%M:%S %Z'
 
 
-def wait_till_delete(callback, check_time = 5, timeout = None):
+def wait_till_delete(callback, check_time=5, timeout=None):
 
     elapsed_time = 0
     while timeout is None or elapsed_time < timeout:
@@ -41,17 +39,18 @@ def wait_till_delete(callback, check_time = 5, timeout = None):
         time.sleep(check_time)  # units of seconds
         elapsed_time += check_time
 
-    raise TimeoutError( "Forecast resource deletion timed-out." )
+    raise TimeoutError("Forecast resource deletion timed-out.")
 
 
-def wait(callback, time_interval = 10):
+def wait(callback, time_interval=10):
 
     status_indicator = util.notebook_utils.StatusIndicator()
 
     while True:
         status = callback()['Status']
         status_indicator.update(status)
-        if status in ('ACTIVE', 'CREATE_FAILED'): break
+        if status in ('ACTIVE', 'CREATE_FAILED'):
+            break
         time.sleep(time_interval)
 
     status_indicator.end()
@@ -417,36 +416,7 @@ def get_or_create_bucket(bucket_name, region=None):
     return bucket_name
 
 
-def plot_forecasts(fcsts, exact, freq = '1D', forecastHorizon=30, time_back = 30, future=pd.DataFrame(), target_col_name='target', reverse=False):
-    p10 = pd.DataFrame(fcsts['Predictions']['p10'])
-    p50 = pd.DataFrame(fcsts['Predictions']['p50'])
-    p90 = pd.DataFrame(fcsts['Predictions']['p90'])
-    pred_int = p50['Timestamp'].apply(lambda x: pd.Timestamp(x))
-    p50['Timestamp'] = pred_int
-    fcst_start_date = pred_int.iloc[0]
-    fcst_end_date = pred_int.iloc[-1]
-    tb = exact.head(time_back) if reverse else exact.tail(time_back)
-    tb.drop(["item_id"], axis=1, inplace=True)
-    tb.rename(columns={'timestamp': 'Timestamp', target_col_name: 'Value'}, inplace=True)
-    time_int = tb['Timestamp'].apply(lambda x: pd.Timestamp(x))
-    tb['Timestamp'] = time_int
-    final = pd.concat([p50, tb], ignore_index=True).sort_values('Timestamp', ignore_index=True)
-    plt.plot(final['Timestamp'].values, final['Value'].values, color = 'k')
-    plt.fill_between(pred_int,
-                     p10['Value'].values,
-                     p90['Value'].values,
-                     color='b', alpha=0.3);
-    plt.axvline(x=pd.Timestamp(fcst_start_date), linewidth=1, color='g', ls='dashed')
-    plt.axvline(x=pd.Timestamp(fcst_end_date), linewidth=1, color='g', ls='dashed')
-    plt.xticks(rotation=30)
-    plt.legend(['Target', 'Forecast'], loc = 'lower left')
-
-    if not future.empty:
-        future_df = future.rename(columns={'timestamp': 'Timestamp', target_col_name: 'Value'})
-        plt.plot(future_df['Timestamp'].values, future_df['Value'].values, color = 'r')
-
-
-def plot_bokeh_forecasts(forecast_dfs, exact, freq = '1D', forecastHorizon=30, time_back = 30, future=pd.DataFrame(), target_col_name='target', reverse=False, title="Stock Price Forecast"):
+def plot_bokeh_forecasts(forecast_dfs, exact, freq='1D', forecastHorizon=30, time_back=30, future=pd.DataFrame(), target_col_name='target', reverse=False, title="Stock Price Forecast"):
     p10 = forecast_dfs['p10']
     p50 = forecast_dfs['p50']
     p90 = forecast_dfs['p90']
@@ -475,10 +445,10 @@ def plot_bokeh_forecasts(forecast_dfs, exact, freq = '1D', forecastHorizon=30, t
     plot.add_tools(*tools)
     plot.yaxis[0].formatter = NumeralTickFormatter(format="$0.00")
     plot.xaxis[0].formatter = DatetimeTickFormatter(hours="%d %b %Y",
-                                                 days="%d %b %Y",
-                                                 months="%d %b %Y",
-                                                 years="%d %b %Y",
-                                                )
+                                                    days="%d %b %Y",
+                                                    months="%d %b %Y",
+                                                    years="%d %b %Y",
+                                                   )
     plot.xaxis[0].major_label_orientation = math.pi/3
     plot.varea(pred_int, p10['Value'].values, p90['Value'].values, fill_color=("blue"), fill_alpha=0.3)
     plot.vspan(x=pd.Timestamp(fcst_start_date), line_color="green", line_width=3, line_dash='dashed')
@@ -493,12 +463,12 @@ def plot_bokeh_forecasts(forecast_dfs, exact, freq = '1D', forecastHorizon=30, t
     return plot
 
 
-def extract_gz( src, dst ):
-    
-    print( f"Extracting {src} to {dst}" )    
+def extract_gz(src, dst):
+
+    print(f"Extracting {src} to {dst}")
 
     with open(dst, 'wb') as fd_dst:
-        with gzip.GzipFile( src, 'rb') as fd_src:
+        with gzip.GzipFile(src, 'rb') as fd_src:
             data = fd_src.read()
             fd_dst.write(data)
 

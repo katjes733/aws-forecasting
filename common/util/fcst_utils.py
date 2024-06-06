@@ -12,6 +12,7 @@ import botocore.exceptions
 import pandas as pd
 from pandas.tseries.holiday import USFederalHolidayCalendar as calendar
 import matplotlib.pyplot as plt
+import numpy as np
 
 from bokeh.plotting import figure
 from bokeh.models import ColumnDataSource, NumeralTickFormatter, DatetimeTickFormatter
@@ -64,13 +65,16 @@ def create_forecast_name(prefix, algorithm, date_format=default_df):
     return forecast_name, forecast_name_unique
 
 
-def create_forecast(forecast_name, forecast_name_unique, predictor_arn, forecast_client, tags=[], ui_date_format=default_ui_df):
+def create_forecast(forecast_name, forecast_name_unique, predictor_arn, forecast_client, existing_resource_strategy="Ask", tags=[], ui_date_format=default_ui_df):
     existing_forecasts = util.get_forecasts(forecast_name, forecast_client, False)
 
     if len(existing_forecasts) > 0:
         print(f"Forecasts exist with the latest one from {existing_forecasts[0]['CreationTime'].strftime(ui_date_format)}.")
-        if not input("Create new forecast (y/N)? ").lower() == "y":
+        if existing_resource_strategy == 'Keep':
             return existing_forecasts[0]["ForecastArn"]
+        elif existing_resource_strategy == 'Ask':
+            if not input("Create new forecast (y/N)? ").lower() == "y":
+                return existing_forecasts[0]["ForecastArn"]
 
     create_forecast_response = forecast_client.create_forecast(ForecastName=forecast_name_unique,
                                                                PredictorArn=predictor_arn,
@@ -208,9 +212,30 @@ def delete_dataset(arn, forecast_client):
     util.wait_till_delete(lambda: forecast_client.delete_dataset(DatasetArn=arn))
 
 
+def get_dataframe(filename, initial_timestamp_column_name, column_names_map, target_column_name):
+    if initial_timestamp_column_name not in column_names_map.keys():
+        raise KeyError(f"{filename}: Column {initial_timestamp_column_name} does not exist in column names dictionary keys: {column_names_map.keys()}")
+    
+    if target_column_name not in column_names_map.values():
+        raise KeyError(f"{filename}: Column {target_column_name} does not exist in column names dictionary values: {column_names_map.values()}")
+        
+    df = pd.read_csv(filename, dtype=object, thousands=',')
+    
+    if initial_timestamp_column_name not in df.columns:
+        raise KeyError(f"{filename}: Column {initial_timestamp_column_name} does not exist in dataframe columns: {df.columns}")
+        
+    initial_target_column_name = list(column_names_map.keys())[list(column_names_map.values()).index(target_column_name)]
+    if initial_target_column_name not in df.columns:
+        raise KeyError(f"{filename}: Column {initial_target_column_name} does not exist in dataframe columns: {df.columns}")
+    
+    return df
+    
+
 def prepare_data(bucket_name,
                  data_key,
                  date_format,
+                 initial_timestamp_column_name: str,
+                 column_names_map: dict[str, str],
                  target_column_name,
                  item_id,
                  fill_missing_values=False,
@@ -218,42 +243,55 @@ def prepare_data(bucket_name,
                  minimal=False,
                  start_date=None,
                  end_date=None):
-    df = pd.read_csv(f"s3://{bucket_name}/{data_key}", dtype=object, thousands=',')
-    df.drop(["Vol.", "Change %"], axis=1, inplace=True)
-    df["Date"] = pd.to_datetime(df["Date"], format=date_format).dt.date
-    df[["Price", "Open", "High", "Low"]] = df[["Price", "Open", "High", "Low"]].replace(',', '', regex=True).astype(float)
-    df.rename(columns={'Date': 'timestamp', 'Price': target_column_name, 'Open': 'open', 'High': 'high', 'Low': 'low'}, inplace=True)
-    df["item_id"] = item_id
+    df = get_dataframe(filename=f"s3://{bucket_name}/{data_key}",
+                       initial_timestamp_column_name=initial_timestamp_column_name,
+                       column_names_map=column_names_map,
+                       target_column_name=target_column_name
+                      )
 
-    if start_date and end_date:
-        mask = (df['timestamp'] >= (start_date.to_pydatetime().date() if fill_missing_values else start_date)) & (df['timestamp'] <= (end_date.to_pydatetime().date() if fill_missing_values else end_date))
-        df = df.loc[mask]
-    elif start_date and not end_date:
-        mask = (df['timestamp'] >= start_date.to_pydatetime().date())
-        df = df.loc[mask]
-    elif not start_date and end_date:
-        mask = (df['timestamp'] <= end_date.to_pydatetime().date())
-        df = df.loc[mask]
+    col_to_drop = list(filter(lambda col: col not in column_names_map.keys(), df.columns))
+    if len(col_to_drop) > 0:
+        df.drop(col_to_drop, axis=1, inplace=True)
+
+    if initial_timestamp_column_name in column_names_map.keys():
+        df[initial_timestamp_column_name] = pd.to_datetime(df[initial_timestamp_column_name], format=date_format).dt.date
+        if start_date and end_date:
+            mask = (df[initial_timestamp_column_name] >= (start_date.to_pydatetime().date() if fill_missing_values else start_date)) & (df[initial_timestamp_column_name] <= (end_date.to_pydatetime().date() if fill_missing_values else end_date))
+            df = df.loc[mask]
+        elif start_date and not end_date:
+            mask = (df[initial_timestamp_column_name] >= start_date.to_pydatetime().date())
+            df = df.loc[mask]
+        elif not start_date and end_date:
+            mask = (df[initial_timestamp_column_name] <= end_date.to_pydatetime().date())
+            df = df.loc[mask]
+
+    col_as_float = list(filter(lambda col: col != initial_timestamp_column_name, df.columns))
+    if len(col_as_float) > 0:
+        df = to_numeric_df(df, col_as_float)
+    
+    df.rename(columns=column_names_map, inplace=True)
+    df["item_id"] = item_id
 
     if use_bank_day:
         df["bank_day"] = 1
 
     if fill_missing_values:
-        new_index = pd.Index(pd.date_range(df.timestamp.min(), df.timestamp.max()), name="timestamp")
-        df.set_index("timestamp").reindex(new_index)
-        df = df.set_index("timestamp").reindex(new_index).reset_index()
+        new_index = pd.Index(pd.date_range(df.timestamp.min(), df.timestamp.max()), name=column_names_map[initial_timestamp_column_name])
+        df.set_index(column_names_map[initial_timestamp_column_name]).reindex(new_index)
+        df = df.set_index(column_names_map[initial_timestamp_column_name]).reindex(new_index).reset_index()
         for col in df.columns:
             if use_bank_day and col == "bank_day":
                 df.fillna({col: 0}, inplace=True)
             else:
                 df[col] = df[col].ffill()
-        df = df.sort_values(by=['timestamp'], ascending=False, ignore_index=True)
+        df = df.sort_values(by=[column_names_map[initial_timestamp_column_name]], ascending=False, ignore_index=True)
 
     if use_bank_day:
         df["bank_day"] = pd.to_numeric(df["bank_day"]).astype("Int32")
 
     if minimal:
-        df.drop(["open", "high", "low"], axis=1, inplace=True)
+        col_to_drop = list(filter(lambda col: col not in [column_names_map[initial_timestamp_column_name], "item_id", target_column_name], df.columns))
+        df.drop(col_to_drop, axis=1, inplace=True)
 
     return df
 
@@ -273,7 +311,9 @@ def get_related_data(s3_client,
                      bucket: str,
                      prefix: str,
                      target_df,
-                     target_column_name:str,
+                     initial_timestamp_column_name: str,
+                     column_names_map: dict[str, str],
+                     target_column_name: str,
                      item_id: str,
                      exclude: list[str]=[],
                      fill_missing_values=False,
@@ -300,24 +340,26 @@ def get_related_data(s3_client,
     if extra_features:
         relevant_target_df_columns = list(filter(lambda col: col != target_column_name, target_df.columns))
     else:
-        relevant_target_df_columns = ["timestamp", "item_id"]
+        relevant_target_df_columns = [column_names_map[initial_timestamp_column_name], "item_id"]
         if use_bank_day:
             relevant_target_df_columns.append("bank_day")
 
-    related_stocks_merged_df = target_df[relevant_target_df_columns].set_index("timestamp")
+    related_stocks_merged_df = target_df[relevant_target_df_columns].set_index(column_names_map[initial_timestamp_column_name])
 
     for key in related_data_csv_objects:
         related_stock_df = prepare_data(
             bucket,
             related_data_csv_objects[key],
             "%m/%d/%Y",
+            initial_timestamp_column_name,
+            column_names_map,
             target_column_name,
             key,
             fill_missing_values=fill_missing_values,
             use_bank_day=use_bank_day,
             start_date=start_date,
             end_date=end_date
-        )[["timestamp", target_column_name]].rename(columns={target_column_name: f"{key}_{target_column_name}"}).set_index("timestamp")
+        )[[column_names_map[initial_timestamp_column_name], target_column_name]].rename(columns={target_column_name: f"{key}_{target_column_name}"}).set_index(column_names_map[initial_timestamp_column_name])
 
         related_stocks_merged_df = related_stocks_merged_df.join(related_stock_df)
 
@@ -544,3 +586,38 @@ def query_results_to_dataframes(query_results, fill_missing_values=False):
             dataframes[key] = df
         results[version] = dataframes
     return results
+
+
+def to_numeric(value: str):
+    regex_result = re.search(r"^(?P<number>[0-9,.]*)(?P<factor>[TMB]?)$", value, re.M)
+
+    if not regex_result:
+        return np.nan
+    else:
+        numeric_value = pd.to_numeric(regex_result.group("number").replace(',', ''), errors='coerce')
+        if pd.isna(numeric_value):
+            return numeric_value
+        if not regex_result.group("factor"):
+            return numeric_value
+        elif regex_result.group("factor") == "T":
+            return numeric_value * 1_000
+        elif regex_result.group("factor") == "M":
+            return numeric_value * 1_000_000
+        elif regex_result.group("factor") == "B":
+            return numeric_value * 1_000_000_000
+
+
+def to_numeric_df(df, columns: list[str]):
+    if not columns or len(columns) == 0:
+        return df
+    else:
+        for col in df.columns:
+            if col in columns:
+                df[col] = df[col].apply(to_numeric)
+        return df
+
+
+def extract_summary_metrics(metric_response, predictor_name):
+    df = pd.DataFrame(metric_response['PredictorEvaluationResults'][0]['TestWindows'][0]['Metrics']['WeightedQuantileLosses'])
+    df['Predictor'] = predictor_name
+    return df

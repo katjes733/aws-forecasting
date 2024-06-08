@@ -62,11 +62,11 @@ def wait(callback, time_interval=10):
 def create_forecast_name(prefix, algorithm, date_format=default_df):
     forecast_name = f"{prefix}_{algorithm}"
     forecast_name_unique = f"{forecast_name}_{datetime.now().strftime(date_format)}"
-    return forecast_name, forecast_name_unique
+    return forecast_name_unique
 
 
-def create_forecast(forecast_name, forecast_name_unique, predictor_arn, forecast_client, existing_resource_strategy="Ask", tags=[], ui_date_format=default_ui_df):
-    existing_forecasts = util.get_forecasts(forecast_name, forecast_client, False)
+def create_forecast(forecast_name_unique, predictor_arn, forecast_client, existing_resource_strategy="Ask", tags=[], ui_date_format=default_ui_df):
+    existing_forecasts = get_forecasts_by_predictor(predictor_arn, forecast_client, True)
 
     if len(existing_forecasts) > 0:
         print(f"Forecasts exist with the latest one from {existing_forecasts[0]['CreationTime'].strftime(ui_date_format)}.")
@@ -171,6 +171,7 @@ def get_dataset_import_jobs(dataset_arn, forecast_client):
             args = {"NextToken": response["NextToken"]}
         else:
             break
+    dataset_import_jobs.sort(key=lambda f: f['CreationTime'], reverse=True)
     return dataset_import_jobs
 
 
@@ -204,6 +205,7 @@ def delete_dataset_import_jobs(dataset_arn, forecast_client):
     for dataset_import_job in get_dataset_import_jobs(dataset_arn, forecast_client):
         print(f"Deleting dataset_import_job: {dataset_import_job['DatasetImportJobArn']}")
         wait_till_delete(lambda: forecast_client.delete_dataset_import_job(DatasetImportJobArn=dataset_import_job["DatasetImportJobArn"]))
+        # TODO: here we should also delete the corresponding files in S3
 
 
 def delete_dataset(arn, forecast_client):
@@ -215,21 +217,28 @@ def delete_dataset(arn, forecast_client):
 def get_dataframe(filename, initial_timestamp_column_name, column_names_map, target_column_name):
     if initial_timestamp_column_name not in column_names_map.keys():
         raise KeyError(f"{filename}: Column {initial_timestamp_column_name} does not exist in column names dictionary keys: {column_names_map.keys()}")
-    
+
     if target_column_name not in column_names_map.values():
         raise KeyError(f"{filename}: Column {target_column_name} does not exist in column names dictionary values: {column_names_map.values()}")
-        
-    df = pd.read_csv(filename, dtype=object, thousands=',')
-    
-    if initial_timestamp_column_name not in df.columns:
-        raise KeyError(f"{filename}: Column {initial_timestamp_column_name} does not exist in dataframe columns: {df.columns}")
-        
-    initial_target_column_name = list(column_names_map.keys())[list(column_names_map.values()).index(target_column_name)]
-    if initial_target_column_name not in df.columns:
-        raise KeyError(f"{filename}: Column {initial_target_column_name} does not exist in dataframe columns: {df.columns}")
-    
+
+    try:
+        df = pd.read_csv(filename, dtype=object, thousands=',')
+
+        if initial_timestamp_column_name not in df.columns:
+            raise KeyError(f"{filename}: Column {initial_timestamp_column_name} does not exist in dataframe columns: {df.columns}")
+
+        initial_target_column_name = list(column_names_map.keys())[list(column_names_map.values()).index(target_column_name)]
+        if initial_target_column_name not in df.columns:
+            raise KeyError(f"{filename}: Column {initial_target_column_name} does not exist in dataframe columns: {df.columns}")
+    except Exception as e:
+        if type(e).__name__ == "FileNotFoundError":
+            df = pd.DataFrame()
+        else:
+            print(type(e).__name__)
+            raise e
+
     return df
-    
+
 
 def prepare_data(bucket_name,
                  data_key,
@@ -247,11 +256,17 @@ def prepare_data(bucket_name,
                        initial_timestamp_column_name=initial_timestamp_column_name,
                        column_names_map=column_names_map,
                        target_column_name=target_column_name
-                      )
-
+                       )
+    
+    if df.empty:
+        return df
+    
     col_to_drop = list(filter(lambda col: col not in column_names_map.keys(), df.columns))
     if len(col_to_drop) > 0:
         df.drop(col_to_drop, axis=1, inplace=True)
+
+    # Drop columns with no values
+    df.dropna(how='all', axis=1, inplace=True)
 
     if initial_timestamp_column_name in column_names_map.keys():
         df[initial_timestamp_column_name] = pd.to_datetime(df[initial_timestamp_column_name], format=date_format).dt.date
@@ -267,8 +282,12 @@ def prepare_data(bucket_name,
 
     col_as_float = list(filter(lambda col: col != initial_timestamp_column_name, df.columns))
     if len(col_as_float) > 0:
-        df = to_numeric_df(df, col_as_float)
-    
+        try:
+            df = to_numeric_df(df, col_as_float)
+        except Exception as e:
+            print(f"s3://{bucket_name}/{data_key} has NaN in columns {col_as_float}.")
+            raise e
+
     df.rename(columns=column_names_map, inplace=True)
     df["item_id"] = item_id
 
@@ -393,16 +412,16 @@ def get_or_create_iam_role( role_name ):
 
     try:
         create_role_response = iam.create_role(
-            RoleName = role_name,
-            AssumeRolePolicyDocument = json.dumps(assume_role_policy_document)
+            RoleName=role_name,
+            AssumeRolePolicyDocument=json.dumps(assume_role_policy_document)
         )
         role_arn = create_role_response["Role"]["Arn"]
         print("Created", role_arn)
 
         print("Attaching policies...")
         iam.attach_role_policy(
-            RoleName = role_name,
-            PolicyArn = "arn:aws:iam::aws:policy/AmazonForecastFullAccess"
+            RoleName=role_name,
+            PolicyArn="arn:aws:iam::aws:policy/AmazonForecastFullAccess"
         )
 
         iam.attach_role_policy(
@@ -420,10 +439,10 @@ def get_or_create_iam_role( role_name ):
     return role_arn
 
 
-def delete_iam_role( role_name ):
+def delete_iam_role(role_name):
     iam = boto3.client("iam")
-    iam.detach_role_policy( PolicyArn = "arn:aws:iam::aws:policy/AmazonS3FullAccess", RoleName = role_name )
-    iam.detach_role_policy( PolicyArn = "arn:aws:iam::aws:policy/AmazonForecastFullAccess", RoleName = role_name )
+    iam.detach_role_policy(PolicyArn="arn:aws:iam::aws:policy/AmazonS3FullAccess", RoleName=role_name)
+    iam.detach_role_policy(PolicyArn="arn:aws:iam::aws:policy/AmazonForecastFullAccess", RoleName=role_name)
     iam.delete_role(RoleName=role_name)
 
 
@@ -476,7 +495,7 @@ def plot_bokeh_forecasts(forecast_dfs, exact, freq='1D', forecastHorizon=30, tim
     hover = HoverTool(tooltips=[('Timestamp', '@Timestamp{%F}'), ('Value', '$@Value{0,0.00}')],
                       formatters={'@Timestamp': 'datetime'},
                       mode='vline'
-                     )
+                      )
     crosshair = CrosshairTool()
     tools = (hover, crosshair)
 

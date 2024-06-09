@@ -640,3 +640,34 @@ def extract_summary_metrics(metric_response, predictor_name):
     df = pd.DataFrame(metric_response['PredictorEvaluationResults'][0]['TestWindows'][0]['Metrics']['WeightedQuantileLosses'])
     df['Predictor'] = predictor_name
     return df
+
+
+def get_exact_by_forecast(forecast_arn: str, item_id: str, target_col_name: str, forecast_client):
+    dataset_group_arn = forecast_client.describe_forecast(ForecastArn=forecast_arn)['DatasetGroupArn']
+    
+    dataset_arn_tts = list(filter(lambda ds: ds.endswith('_tts'), forecast_client.describe_dataset_group(DatasetGroupArn=dataset_group_arn)['DatasetArns']))[0]
+    exact_path = util.get_dataset_import_jobs(dataset_arn_tts, forecast_client)[0]['DataSource']['S3Config']['Path']
+
+    exact_df = util.load_exact_sol(exact_path, item_id, target_col_name=target_col_name)
+
+    return exact_df
+
+
+def get_exacts_by_forecasts(forecast_arns, item_id: str, target_col_name: str, forecast_client):
+    exact_dfs = {}
+    for version, forecast_arn in forecast_arns.items():
+        exact_df = get_exact_by_forecast(forecast_arn, item_id, target_col_name, forecast_client)
+        exact_dfs[version] = exact_df
+        
+    return exact_dfs
+
+
+def get_simple_tags_by_arn(arn: str, forecast_client):
+    return get_simple_tags_by_tags(forecast_client.list_tags_for_resource(ResourceArn=arn)['Tags'])
+
+
+def get_simple_tags_by_tags(resource_tags: list[dict]):
+    simple_tags = {}
+    for resource_tag in resource_tags:
+        simple_tags[resource_tag['Key']] = resource_tag['Value']
+    return simple_tags

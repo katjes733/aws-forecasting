@@ -187,29 +187,37 @@ def delete_predictors(dataset_group_arn: str, forecast_client):
         delete_predictor(predictor["PredictorArn"], forecast_client)
 
 
-def delete_dataset_group(dataset_group_arn: str, forecast_client):
+def delete_dataset_group(dataset_group_arn: str, forecast_client, s3_client=None):
     try:
         response = forecast_client.describe_dataset_group(DatasetGroupArn=dataset_group_arn)
 
         delete_predictors(dataset_group_arn, forecast_client)
 
         for dataset_arn in response["DatasetArns"]:
-            delete_dataset(dataset_arn, forecast_client)
+            delete_dataset(dataset_arn, forecast_client, s3_client)
         print(f"Deleting dataset_group {dataset_group_arn}...")
         wait_till_delete(lambda: forecast_client.delete_dataset_group(DatasetGroupArn=dataset_group_arn))
     except forecast_client.exceptions.ResourceNotFoundException:
         print(f"Dataset with ARN '{dataset_group_arn}' does not exist.")
 
 
-def delete_dataset_import_jobs(dataset_arn, forecast_client):
+def delete_dataset_import_jobs(dataset_arn, forecast_client, s3_client=None):
     for dataset_import_job in get_dataset_import_jobs(dataset_arn, forecast_client):
         print(f"Deleting dataset_import_job: {dataset_import_job['DatasetImportJobArn']}")
         wait_till_delete(lambda: forecast_client.delete_dataset_import_job(DatasetImportJobArn=dataset_import_job["DatasetImportJobArn"]))
-        # TODO: here we should also delete the corresponding files in S3
+        if s3_client:
+            path = dataset_import_job['DataSource']['S3Config']['Path']
+            print(f"Deleting file: {path}")
+            regex_result = re.search(r"s3://(?P<bucket>[a-z0-9-]+)/(?P<key>.+)", path, re.M)
+            bucket = regex_result.group('bucket')
+            key = regex_result.group('key')
+            s3_client.delete_object(Bucket=bucket, Key=key)
+        else:
+            print("S3 Client not defined")
 
 
-def delete_dataset(arn, forecast_client):
-    delete_dataset_import_jobs(arn, forecast_client)
+def delete_dataset(arn, forecast_client, s3_Client=None):
+    delete_dataset_import_jobs(arn, forecast_client, s3_Client)
     print(f"Deleting dataset: {arn}")
     util.wait_till_delete(lambda: forecast_client.delete_dataset(DatasetArn=arn))
 
@@ -644,7 +652,7 @@ def extract_summary_metrics(metric_response, predictor_name):
 
 def get_exact_by_forecast(forecast_arn: str, item_id: str, target_col_name: str, forecast_client):
     dataset_group_arn = forecast_client.describe_forecast(ForecastArn=forecast_arn)['DatasetGroupArn']
-    
+
     dataset_arn_tts = list(filter(lambda ds: ds.endswith('_tts'), forecast_client.describe_dataset_group(DatasetGroupArn=dataset_group_arn)['DatasetArns']))[0]
     exact_path = util.get_dataset_import_jobs(dataset_arn_tts, forecast_client)[0]['DataSource']['S3Config']['Path']
 
@@ -658,7 +666,7 @@ def get_exacts_by_forecasts(forecast_arns, item_id: str, target_col_name: str, f
     for version, forecast_arn in forecast_arns.items():
         exact_df = get_exact_by_forecast(forecast_arn, item_id, target_col_name, forecast_client)
         exact_dfs[version] = exact_df
-        
+
     return exact_dfs
 
 
@@ -671,3 +679,34 @@ def get_simple_tags_by_tags(resource_tags: list[dict]):
     for resource_tag in resource_tags:
         simple_tags[resource_tag['Key']] = resource_tag['Value']
     return simple_tags
+
+
+def get_versions(max_value: int, patterns=None):
+    MIN = 1
+    individual_versions = []
+    patterns_stripped = patterns.strip() if patterns else patterns
+    patterns_edited = patterns_stripped if patterns_stripped else f"{MIN}-{max_value}"
+    for one_pattern in patterns_edited.split(','):
+        single = None
+        start = None
+        end = None
+        one_pattern_stripped = one_pattern.strip()
+        match = re.search(r"^(?P<start>\d*)\-(?P<end>\d*)$|^(?P<single>\d+)$", one_pattern_stripped, re.M)
+        if match and match.group('single'):
+            single = match.group('single')
+        if match and match.group('start'):
+            start = match.group('start')
+        if match and match.group('end'):
+            end = match.group('end')
+
+        if start and end and not single:
+            individual_versions.extend(list(range(int(start), int(end) + 1)))
+        elif start and not end and not single:
+            individual_versions.extend(list(range(int(start), max_value + 1)))
+        elif not start and end and not single:
+            individual_versions.extend(list(range(MIN, int(end) + 1)))
+        elif not start and not end and single:
+            individual_versions.append(int(single))
+
+    individual_versions.sort()
+    return list(filter(lambda version: version >= MIN and version <= max_value, individual_versions))

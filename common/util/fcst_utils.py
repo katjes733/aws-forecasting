@@ -62,11 +62,11 @@ def wait(callback, time_interval=10):
 def create_forecast_name(prefix, algorithm, date_format=default_df):
     forecast_name = f"{prefix}_{algorithm}"
     forecast_name_unique = f"{forecast_name}_{datetime.now().strftime(date_format)}"
-    return forecast_name, forecast_name_unique
+    return forecast_name_unique
 
 
-def create_forecast(forecast_name, forecast_name_unique, predictor_arn, forecast_client, existing_resource_strategy="Ask", tags=[], ui_date_format=default_ui_df):
-    existing_forecasts = util.get_forecasts(forecast_name, forecast_client, False)
+def create_forecast(forecast_name_unique, predictor_arn, forecast_client, existing_resource_strategy="Ask", tags=[], ui_date_format=default_ui_df):
+    existing_forecasts = get_forecasts_by_predictor(predictor_arn, forecast_client, True)
 
     if len(existing_forecasts) > 0:
         print(f"Forecasts exist with the latest one from {existing_forecasts[0]['CreationTime'].strftime(ui_date_format)}.")
@@ -171,6 +171,7 @@ def get_dataset_import_jobs(dataset_arn, forecast_client):
             args = {"NextToken": response["NextToken"]}
         else:
             break
+    dataset_import_jobs.sort(key=lambda f: f['CreationTime'], reverse=True)
     return dataset_import_jobs
 
 
@@ -186,28 +187,37 @@ def delete_predictors(dataset_group_arn: str, forecast_client):
         delete_predictor(predictor["PredictorArn"], forecast_client)
 
 
-def delete_dataset_group(dataset_group_arn: str, forecast_client):
+def delete_dataset_group(dataset_group_arn: str, forecast_client, s3_client=None):
     try:
         response = forecast_client.describe_dataset_group(DatasetGroupArn=dataset_group_arn)
 
         delete_predictors(dataset_group_arn, forecast_client)
 
         for dataset_arn in response["DatasetArns"]:
-            delete_dataset(dataset_arn, forecast_client)
+            delete_dataset(dataset_arn, forecast_client, s3_client)
         print(f"Deleting dataset_group {dataset_group_arn}...")
         wait_till_delete(lambda: forecast_client.delete_dataset_group(DatasetGroupArn=dataset_group_arn))
     except forecast_client.exceptions.ResourceNotFoundException:
         print(f"Dataset with ARN '{dataset_group_arn}' does not exist.")
 
 
-def delete_dataset_import_jobs(dataset_arn, forecast_client):
+def delete_dataset_import_jobs(dataset_arn, forecast_client, s3_client=None):
     for dataset_import_job in get_dataset_import_jobs(dataset_arn, forecast_client):
         print(f"Deleting dataset_import_job: {dataset_import_job['DatasetImportJobArn']}")
         wait_till_delete(lambda: forecast_client.delete_dataset_import_job(DatasetImportJobArn=dataset_import_job["DatasetImportJobArn"]))
+        if s3_client:
+            path = dataset_import_job['DataSource']['S3Config']['Path']
+            print(f"Deleting file: {path}")
+            regex_result = re.search(r"s3://(?P<bucket>[a-z0-9-]+)/(?P<key>.+)", path, re.M)
+            bucket = regex_result.group('bucket')
+            key = regex_result.group('key')
+            s3_client.delete_object(Bucket=bucket, Key=key)
+        else:
+            print("S3 Client not defined")
 
 
-def delete_dataset(arn, forecast_client):
-    delete_dataset_import_jobs(arn, forecast_client)
+def delete_dataset(arn, forecast_client, s3_Client=None):
+    delete_dataset_import_jobs(arn, forecast_client, s3_Client)
     print(f"Deleting dataset: {arn}")
     util.wait_till_delete(lambda: forecast_client.delete_dataset(DatasetArn=arn))
 
@@ -215,21 +225,28 @@ def delete_dataset(arn, forecast_client):
 def get_dataframe(filename, initial_timestamp_column_name, column_names_map, target_column_name):
     if initial_timestamp_column_name not in column_names_map.keys():
         raise KeyError(f"{filename}: Column {initial_timestamp_column_name} does not exist in column names dictionary keys: {column_names_map.keys()}")
-    
+
     if target_column_name not in column_names_map.values():
         raise KeyError(f"{filename}: Column {target_column_name} does not exist in column names dictionary values: {column_names_map.values()}")
-        
-    df = pd.read_csv(filename, dtype=object, thousands=',')
-    
-    if initial_timestamp_column_name not in df.columns:
-        raise KeyError(f"{filename}: Column {initial_timestamp_column_name} does not exist in dataframe columns: {df.columns}")
-        
-    initial_target_column_name = list(column_names_map.keys())[list(column_names_map.values()).index(target_column_name)]
-    if initial_target_column_name not in df.columns:
-        raise KeyError(f"{filename}: Column {initial_target_column_name} does not exist in dataframe columns: {df.columns}")
-    
+
+    try:
+        df = pd.read_csv(filename, dtype=object, thousands=',')
+
+        if initial_timestamp_column_name not in df.columns:
+            raise KeyError(f"{filename}: Column {initial_timestamp_column_name} does not exist in dataframe columns: {df.columns}")
+
+        initial_target_column_name = list(column_names_map.keys())[list(column_names_map.values()).index(target_column_name)]
+        if initial_target_column_name not in df.columns:
+            raise KeyError(f"{filename}: Column {initial_target_column_name} does not exist in dataframe columns: {df.columns}")
+    except Exception as e:
+        if type(e).__name__ == "FileNotFoundError":
+            df = pd.DataFrame()
+        else:
+            print(type(e).__name__)
+            raise e
+
     return df
-    
+
 
 def prepare_data(bucket_name,
                  data_key,
@@ -247,11 +264,17 @@ def prepare_data(bucket_name,
                        initial_timestamp_column_name=initial_timestamp_column_name,
                        column_names_map=column_names_map,
                        target_column_name=target_column_name
-                      )
-
+                       )
+    
+    if df.empty:
+        return df
+    
     col_to_drop = list(filter(lambda col: col not in column_names_map.keys(), df.columns))
     if len(col_to_drop) > 0:
         df.drop(col_to_drop, axis=1, inplace=True)
+
+    # Drop columns with no values
+    df.dropna(how='all', axis=1, inplace=True)
 
     if initial_timestamp_column_name in column_names_map.keys():
         df[initial_timestamp_column_name] = pd.to_datetime(df[initial_timestamp_column_name], format=date_format).dt.date
@@ -267,8 +290,12 @@ def prepare_data(bucket_name,
 
     col_as_float = list(filter(lambda col: col != initial_timestamp_column_name, df.columns))
     if len(col_as_float) > 0:
-        df = to_numeric_df(df, col_as_float)
-    
+        try:
+            df = to_numeric_df(df, col_as_float)
+        except Exception as e:
+            print(f"s3://{bucket_name}/{data_key} has NaN in columns {col_as_float}.")
+            raise e
+
     df.rename(columns=column_names_map, inplace=True)
     df["item_id"] = item_id
 
@@ -393,16 +420,16 @@ def get_or_create_iam_role( role_name ):
 
     try:
         create_role_response = iam.create_role(
-            RoleName = role_name,
-            AssumeRolePolicyDocument = json.dumps(assume_role_policy_document)
+            RoleName=role_name,
+            AssumeRolePolicyDocument=json.dumps(assume_role_policy_document)
         )
         role_arn = create_role_response["Role"]["Arn"]
         print("Created", role_arn)
 
         print("Attaching policies...")
         iam.attach_role_policy(
-            RoleName = role_name,
-            PolicyArn = "arn:aws:iam::aws:policy/AmazonForecastFullAccess"
+            RoleName=role_name,
+            PolicyArn="arn:aws:iam::aws:policy/AmazonForecastFullAccess"
         )
 
         iam.attach_role_policy(
@@ -420,10 +447,10 @@ def get_or_create_iam_role( role_name ):
     return role_arn
 
 
-def delete_iam_role( role_name ):
+def delete_iam_role(role_name):
     iam = boto3.client("iam")
-    iam.detach_role_policy( PolicyArn = "arn:aws:iam::aws:policy/AmazonS3FullAccess", RoleName = role_name )
-    iam.detach_role_policy( PolicyArn = "arn:aws:iam::aws:policy/AmazonForecastFullAccess", RoleName = role_name )
+    iam.detach_role_policy(PolicyArn="arn:aws:iam::aws:policy/AmazonS3FullAccess", RoleName=role_name)
+    iam.detach_role_policy(PolicyArn="arn:aws:iam::aws:policy/AmazonForecastFullAccess", RoleName=role_name)
     iam.delete_role(RoleName=role_name)
 
 
@@ -476,7 +503,7 @@ def plot_bokeh_forecasts(forecast_dfs, exact, freq='1D', forecastHorizon=30, tim
     hover = HoverTool(tooltips=[('Timestamp', '@Timestamp{%F}'), ('Value', '$@Value{0,0.00}')],
                       formatters={'@Timestamp': 'datetime'},
                       mode='vline'
-                     )
+                      )
     crosshair = CrosshairTool()
     tools = (hover, crosshair)
 
@@ -553,12 +580,12 @@ def get_schema_attributes(df, domain: str, target_column_name: str):
     return attributes
 
 
-def get_relevant_forecasts(forecast_name_prefix, data_version, algorithm, forecast_client):
+def get_relevant_forecasts(forecast_name_prefix: str, versions: list[int], algorithm: str, forecast_client):
     relevant_forecasts = {}
-    for version in range(data_version + 1):
+    for version in versions:
         forecasts = util.get_forecasts_by_predictor(f"{forecast_name_prefix}{version}_{algorithm}".replace("-", "_"), forecast_client, exact=False)
         if len(forecasts) > 0:
-            relevant_forecasts[version] = forecasts[0]["ForecastArn"]
+            relevant_forecasts[str(version)] = forecasts[0]["ForecastArn"]
     return relevant_forecasts
 
 
@@ -621,3 +648,103 @@ def extract_summary_metrics(metric_response, predictor_name):
     df = pd.DataFrame(metric_response['PredictorEvaluationResults'][0]['TestWindows'][0]['Metrics']['WeightedQuantileLosses'])
     df['Predictor'] = predictor_name
     return df
+
+
+def get_exact_by_forecast(forecast_arn: str, item_id: str, target_col_name: str, forecast_client):
+    dataset_group_arn = forecast_client.describe_forecast(ForecastArn=forecast_arn)['DatasetGroupArn']
+
+    dataset_arn_tts = list(filter(lambda ds: ds.endswith('_tts'), forecast_client.describe_dataset_group(DatasetGroupArn=dataset_group_arn)['DatasetArns']))[0]
+    exact_path = util.get_dataset_import_jobs(dataset_arn_tts, forecast_client)[0]['DataSource']['S3Config']['Path']
+
+    exact_df = util.load_exact_sol(exact_path, item_id, target_col_name=target_col_name)
+
+    return exact_df
+
+
+def get_exacts_by_forecasts(forecast_arns, item_id: str, target_col_name: str, forecast_client):
+    exact_dfs = {}
+    for version, forecast_arn in forecast_arns.items():
+        exact_df = get_exact_by_forecast(forecast_arn, item_id, target_col_name, forecast_client)
+        exact_dfs[version] = exact_df
+
+    return exact_dfs
+
+
+def get_simple_tags_by_arn(arn: str, forecast_client):
+    return get_simple_tags_by_tags(forecast_client.list_tags_for_resource(ResourceArn=arn)['Tags'])
+
+
+def get_simple_tags_by_tags(resource_tags: list[dict]):
+    simple_tags = {}
+    for resource_tag in resource_tags:
+        simple_tags[resource_tag['Key']] = resource_tag['Value']
+    return simple_tags
+
+
+def get_versions(max_value: int, patterns=None):
+    MIN = 1
+    individual_versions = []
+    patterns_stripped = patterns.strip() if patterns else patterns
+    patterns_edited = patterns_stripped if patterns_stripped else f"{MIN}-{max_value}"
+    for one_pattern in patterns_edited.split(','):
+        single = None
+        start = None
+        end = None
+        one_pattern_stripped = one_pattern.strip()
+        match = re.search(r"^(?P<start>\d*)\-(?P<end>\d*)$|^(?P<single>\d+)$", one_pattern_stripped, re.M)
+        if match and match.group('single'):
+            single = match.group('single')
+        if match and match.group('start'):
+            start = match.group('start')
+        if match and match.group('end'):
+            end = match.group('end')
+
+        if start and end and not single:
+            individual_versions.extend(list(range(int(start), int(end) + 1)))
+        elif start and not end and not single:
+            individual_versions.extend(list(range(int(start), max_value + 1)))
+        elif not start and end and not single:
+            individual_versions.extend(list(range(MIN, int(end) + 1)))
+        elif not start and not end and single:
+            individual_versions.append(int(single))
+
+    individual_versions.sort()
+    return list(filter(lambda version: version >= MIN and version <= max_value, individual_versions))
+
+
+def is_recreate_resource(
+        resource_arn: str,
+        forecast_client,
+        date_format: str,
+        min_date_df,
+        max_date_df,
+        existing_resource_strategy: str,
+        user_question="Recreate resource"):
+    all_tags = util.get_simple_tags_by_arn(resource_arn, forecast_client)
+
+    force_recreate = False
+    if 'DATE_RANGE_MIN' in all_tags and all_tags['DATE_RANGE_MIN'] and \
+            'DATE_RANGE_MAX' in all_tags and all_tags['DATE_RANGE_MAX']:
+        min_date_tag = datetime.strptime(all_tags['DATE_RANGE_MIN'], date_format).date()
+        max_date_tag = datetime.strptime(all_tags['DATE_RANGE_MAX'], date_format).date()
+
+        if min_date_tag == min_date_df and max_date_tag == max_date_df:
+            print(f'Date ranges for dataframe ({min_date_df} - {max_date_df}) and from tags ({min_date_tag} - {max_date_tag}) match.')
+        else:
+            print(f'Date ranges for dataframe ({min_date_df} - {max_date_df}) and from tags ({min_date_tag} - {max_date_tag}) do not match.')
+            force_recreate = True
+    else:
+        print('Date range tags are incomplete.')
+        force_recreate = True
+
+    if existing_resource_strategy == 'Keep' and not force_recreate:
+        return False
+    elif existing_resource_strategy == 'Recreate' or (existing_resource_strategy == 'Keep' and force_recreate):
+        return True
+    elif existing_resource_strategy == 'Ask':
+        if input(f"{user_question.strip()} (y/N)? ").lower() == "y":
+            return True
+        else:
+            return False
+    else:
+        raise ValueError("Cannot determine whether or not to recreate resource")

@@ -580,12 +580,12 @@ def get_schema_attributes(df, domain: str, target_column_name: str):
     return attributes
 
 
-def get_relevant_forecasts(forecast_name_prefix, data_version, algorithm, forecast_client):
+def get_relevant_forecasts(forecast_name_prefix: str, versions: list[int], algorithm: str, forecast_client):
     relevant_forecasts = {}
-    for version in range(data_version + 1):
+    for version in versions:
         forecasts = util.get_forecasts_by_predictor(f"{forecast_name_prefix}{version}_{algorithm}".replace("-", "_"), forecast_client, exact=False)
         if len(forecasts) > 0:
-            relevant_forecasts[version] = forecasts[0]["ForecastArn"]
+            relevant_forecasts[str(version)] = forecasts[0]["ForecastArn"]
     return relevant_forecasts
 
 
@@ -710,3 +710,41 @@ def get_versions(max_value: int, patterns=None):
 
     individual_versions.sort()
     return list(filter(lambda version: version >= MIN and version <= max_value, individual_versions))
+
+
+def is_recreate_resource(
+        resource_arn: str,
+        forecast_client,
+        date_format: str,
+        min_date_df,
+        max_date_df,
+        existing_resource_strategy: str,
+        user_question="Recreate resource"):
+    all_tags = util.get_simple_tags_by_arn(resource_arn, forecast_client)
+
+    force_recreate = False
+    if 'DATE_RANGE_MIN' in all_tags and all_tags['DATE_RANGE_MIN'] and \
+            'DATE_RANGE_MAX' in all_tags and all_tags['DATE_RANGE_MAX']:
+        min_date_tag = datetime.strptime(all_tags['DATE_RANGE_MIN'], date_format).date()
+        max_date_tag = datetime.strptime(all_tags['DATE_RANGE_MAX'], date_format).date()
+
+        if min_date_tag == min_date_df and max_date_tag == max_date_df:
+            print(f'Date ranges for dataframe ({min_date_df} - {max_date_df}) and from tags ({min_date_tag} - {max_date_tag}) match.')
+        else:
+            print(f'Date ranges for dataframe ({min_date_df} - {max_date_df}) and from tags ({min_date_tag} - {max_date_tag}) do not match.')
+            force_recreate = True
+    else:
+        print('Date range tags are incomplete.')
+        force_recreate = True
+
+    if existing_resource_strategy == 'Keep' and not force_recreate:
+        return False
+    elif existing_resource_strategy == 'Recreate' or (existing_resource_strategy == 'Keep' and force_recreate):
+        return True
+    elif existing_resource_strategy == 'Ask':
+        if input(f"{user_question.strip()} (y/N)? ").lower() == "y":
+            return True
+        else:
+            return False
+    else:
+        raise ValueError("Cannot determine whether or not to recreate resource")
